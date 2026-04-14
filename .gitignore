@@ -9,7 +9,6 @@ __pycache__/
 
 # Model files (trained models only)
 models/*.pth
-models/*.pt
 models/*.pkl
 
 # Logs
