@@ -1,5 +1,5 @@
 """
-Train LSTM model from TraderAlfred market.db
+Targeting 1% Growth: Including Stocks & ETFs (Excluding Preferred Stocks)
 """
 import os, sys, time, sqlite3, warnings
 warnings.filterwarnings("ignore")
@@ -13,286 +13,178 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_auc_score
 
 # ── paths ──────────────────────────────────────────────────────────────────
-PROJECT_DIR = "/root/project/LSTMScreener"
-DATA_DB     = "/root/project/TraderAlfred/data/market.db"
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DB     = os.path.join(PROJECT_DIR, "data", "market.db")
 MODEL_DIR   = os.path.join(PROJECT_DIR, "models")
 
 # ── hyperparameters ───────────────────────────────────────────────────────
 SEQ_LEN    = 60
-EPOCHS     = 30
-BATCH_SIZE = 64
+EPOCHS     = 200
+BATCH_SIZE = 512
 LR         = 0.001
-DEVICE     = "cpu"
+DEVICE     = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
 SEED       = 42
+TARGET_GAIN = 0.01 # Still target at least 1% gain
 
-# ── feature columns (21 total) ─────────────────────────────────────────────
-BASE_COLS  = ["open","high","low","close","volume"]
-FEAT_COLS  = ["ma5","ma20","ma60","ma120",
-              "rsi","macd","macd_signal","macd_hist",
-              "bb_upper","bb_lower","bb_width","vol_ratio",
-              "momentum_5","momentum_20","return_1d","volatility_20"]
-ALL_COLS   = BASE_COLS + FEAT_COLS   # 21 columns
-INPUT_SIZE = len(ALL_COLS)
-
+print(f"Using device: {DEVICE} | Target Gain: {TARGET_GAIN*100}%")
 os.makedirs(MODEL_DIR, exist_ok=True)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# ── technical indicators ────────────────────────────────────────────────────
+ALL_COLS = [
+    "ret", "vol_ret", "rsi", "macd_rel", "ma5_rel", "ma20_rel", "ma60_rel",
+    "bb_width", "volatility", "hl_ratio", "oc_ratio", "upper_shadow", "lower_shadow", "vol_ma_rel"
+]
+INPUT_SIZE = len(ALL_COLS)
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    close = df["close"]
-    for w in [5, 20, 60, 120]:
-        df[f"ma{w}"] = close.rolling(w).mean()
+    close = df["close"].replace(0, np.nan)
+    high, low, open_p, vol = df["high"], df["low"], df["open"], df["volume"].replace(0, np.nan)
+    df["ret"] = close.pct_change().fillna(0)
+    df["vol_ret"] = vol.pct_change().fillna(0)
+    for w in [5, 20, 60]:
+        ma = close.rolling(w).mean()
+        df[f"ma{w}_rel"] = (close / ma - 1).fillna(0)
+    df["hl_ratio"] = ((high - low) / close).fillna(0)
+    df["oc_ratio"] = ((close - open_p) / close).fillna(0)
+    df["upper_shadow"] = ((high - df[["open", "close"]].max(axis=1)) / close).fillna(0)
+    df["lower_shadow"] = ((df[["open", "close"]].min(axis=1) - low) / close).fillna(0)
+    vol_ma20 = vol.rolling(20).mean()
+    df["vol_ma_rel"] = (vol / vol_ma20 - 1).fillna(0)
     delta = close.diff()
-    gain  = delta.where(delta > 0, 0.0).rolling(14).mean()
-    loss  = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-    ema_fast = close.ewm(span=12, adjust=False).mean()
-    ema_slow = close.ewm(span=26, adjust=False).mean()
-    df["macd"]        = ema_fast - ema_slow
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"]   = df["macd"] - df["macd_signal"]
-    bb_mid = close.rolling(20).mean()
-    bb_std = close.rolling(20).std()
-    df["bb_upper"] = bb_mid + 2 * bb_std
-    df["bb_lower"] = bb_mid - 2 * bb_std
-    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / bb_mid
-    df["vol_ma20"]  = df["volume"].rolling(20).mean()
-    df["vol_ratio"] = df["volume"] / df["vol_ma20"].replace(0, np.nan)
-    df["momentum_5"]  = close / close.shift(5)  - 1
-    df["momentum_20"] = close / close.shift(20) - 1
-    df["return_1d"]   = close.pct_change()
-    df["volatility_20"] = df["return_1d"].rolling(20).std()
+    gain, loss = delta.where(delta > 0, 0).rolling(14).mean(), (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["rsi"] = (100 - (100 / (1 + rs.fillna(0)))).fillna(50) / 100.0
+    ema_fast, ema_slow = close.ewm(span=12, adjust=False).mean(), close.ewm(span=26, adjust=False).mean()
+    df["macd_rel"] = ((ema_fast - ema_slow) / close).fillna(0)
+    bb_mid, bb_std = close.rolling(20).mean(), close.rolling(20).std()
+    df["bb_width"] = ((bb_std * 4) / bb_mid).fillna(0)
+    df["volatility"] = df["ret"].rolling(20).std().fillna(0)
     return df
 
-# ── LSTM model ─────────────────────────────────────────────────────────────
-class LSTMModel(nn.Module):
-    def __init__(self, input_size=INPUT_SIZE, hidden_size=128, num_layers=2, dropout=0.3):
+class ResidualGRU(nn.Module):
+    def __init__(self, input_size=INPUT_SIZE, hidden_size=128, num_layers=2, dropout=0.5):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.ln_in = nn.LayerNorm(input_size)
+        self.grus = nn.ModuleList([
+            nn.GRU(input_size if i == 0 else hidden_size, hidden_size, batch_first=True)
+            for i in range(num_layers)
+        ])
+        self.ln_mid = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(num_layers)])
+        self.dropout = nn.Dropout(dropout)
         self.attn = nn.Linear(hidden_size, 1, bias=False)
         self.fc = nn.Sequential(
             nn.Linear(hidden_size, 64),
-            nn.ReLU(),
+            nn.BatchNorm1d(64),
+            nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(64, 1),
         )
+        for name, param in self.named_parameters():
+            if 'weight' in name and param.dim() >= 2:
+                nn.init.xavier_uniform_(param.data)
+            elif 'bias' in name:
+                nn.init.constant_(param.data, 0)
 
     def forward(self, x):
-        out, _ = self.lstm(x)                     # (B, SEQ_LEN, hidden)
-        scores = self.attn(out).squeeze(-1)        # (B, SEQ_LEN)
-        w = torch.softmax(scores, dim=1).unsqueeze(1)  # (B, 1, SEQ_LEN)
-        ctx = torch.bmm(w, out).squeeze(1)        # (B, hidden)
-        return self.fc(ctx).squeeze(-1)           # (B,)
+        x = self.ln_in(x)
+        h_state = None
+        for i, gru in enumerate(self.grus):
+            out, _ = gru(x, h_state)
+            if i > 0: out = out + x
+            out = self.ln_mid[i](out)
+            x = self.dropout(out)
+        scores = self.attn(x).squeeze(-1)
+        weights = torch.softmax(scores, dim=1).unsqueeze(1)
+        context = torch.bmm(weights, x).squeeze(1)
+        return self.fc(context).squeeze(-1)
 
-# ─────────────────────────────────────────────────────────────────────────────
-print("=" * 60)
-print("STEP 1: Load data from market.db")
-print("=" * 60)
-t_start = time.time()
+print("STEP 1: Load Stock & ETF data (Excluding Preferred Stocks)")
 conn = sqlite3.connect(DATA_DB)
-df_candles = pd.read_sql(
-    "SELECT code, date, open, high, low, close, volume FROM candles ORDER BY code, date",
-    conn
-)
+df_stocks = pd.read_sql("""
+    SELECT code, name FROM stocks 
+    WHERE name NOT LIKE '%우'
+      AND name NOT LIKE '%우B'
+      AND name NOT LIKE '%우C'
+""", conn)
+valid_codes = df_stocks["code"].tolist()
+placeholders = ','.join(['?'] * len(valid_codes))
+df_candles = pd.read_sql(f"SELECT code, date, open, high, low, close, volume FROM candles WHERE code IN ({placeholders}) ORDER BY code, date", conn, params=valid_codes)
 conn.close()
-print(f"  Loaded {len(df_candles):,} rows in {time.time()-t_start:.1f}s")
-print(f"  Stocks: {df_candles['code'].nunique()}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("STEP 2: Build sequences (SEQ_LEN=60, horizon=1)")
-print("=" * 60)
-t2 = time.time()
+print(f"  Total entities after filtering: {len(valid_codes)}")
+
+print("STEP 2: Build sequences (Label: Gain >= 1%)")
 all_X, all_y = [], []
-stock_codes = df_candles["code"].unique()
-
-for code in stock_codes:
-    df_s = df_candles[df_candles["code"] == code].copy()
-    df_s["date"] = pd.to_datetime(df_s["date"])
-    df_s = df_s.sort_values("date").reset_index(drop=True)
-    df_s = add_indicators(df_s)
-
-    # fill any missing feature columns with 0
-    for col in ALL_COLS:
-        if col not in df_s.columns:
-            df_s[col] = 0.0
-
-    data = df_s[ALL_COLS].values.astype(np.float32)
-    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-
-    for i in range(len(data) - SEQ_LEN - 1):
-        price_now  = data[i + SEQ_LEN - 1, 3]   # close at end of window
-        price_next = data[i + SEQ_LEN, 3]         # next-day close
-        label = 1.0 if price_next >= price_now else 0.0
-        all_X.append(data[i : i + SEQ_LEN])
+for code in valid_codes:
+    df_s = df_candles[df_candles["code"] == code].sort_values("date").reset_index(drop=True)
+    if len(df_s) < SEQ_LEN + 30: continue
+    df_feat = add_indicators(df_s).iloc[30:].reset_index(drop=True)
+    df_feat["close"] = df_s["close"].iloc[30:].values
+    df_feat = df_feat.dropna().reset_index(drop=True)
+    data_feats = np.nan_to_num(df_feat[ALL_COLS].values.astype(np.float32))
+    data_close = df_feat["close"].values.astype(np.float32)
+    for i in range(len(data_feats) - SEQ_LEN):
+        ret_next = (data_close[i + SEQ_LEN] / data_close[i + SEQ_LEN - 1]) - 1
+        label = 1.0 if ret_next >= TARGET_GAIN else 0.0
+        all_X.append(data_feats[i : i + SEQ_LEN])
         all_y.append(label)
 
-X = np.array(all_X, dtype=np.float32)
+X = np.nan_to_num(np.array(all_X, dtype=np.float32))
 y = np.array(all_y, dtype=np.float32)
-print(f"  Built {len(X):,} samples in {time.time()-t2:.1f}s")
-print(f"  Label=1 (up):   {int(y.sum()):,} ({y.mean()*100:.1f}%)")
-print(f"  Label=0 (down): {int(len(y)-y.sum()):,} ({(1-y.mean())*100:.1f}%)")
+print(f"  Total samples: {len(X):,}, Positive (>=1% gain): {y.mean()*100:.1f}%")
 
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("STEP 3: Train/Val split (80/20)")
-print("=" * 60)
-X_train, X_val, y_train, y_val = train_test_split(
-    X, y, test_size=0.2, random_state=SEED, shuffle=True
-)
-print(f"  Train: {len(X_train):,} | Val: {len(X_val):,}")
-
-# Normalize: fit on train only
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=SEED)
 mean = X_train.mean(axis=(0, 1), keepdims=True)
-std  = X_train.std(axis=(0, 1), keepdims=True) + 1e-8
-X_train_n = (X_train - mean) / std
-X_val_n   = (X_val   - mean) / std
+std  = X_train.std(axis=(0, 1), keepdims=True) + 1e-5
+X_train_n = np.nan_to_num((X_train - mean) / std)
+X_val_n   = np.nan_to_num((X_val   - mean) / std)
 
-train_ds = TensorDataset(torch.from_numpy(X_train_n), torch.from_numpy(y_train))
-val_ds   = TensorDataset(torch.from_numpy(X_val_n),   torch.from_numpy(y_val))
-train_ld = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-val_ld   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False)
+train_ld = DataLoader(TensorDataset(torch.from_numpy(X_train_n), torch.from_numpy(y_train)), batch_size=BATCH_SIZE, shuffle=True)
+val_ld   = DataLoader(TensorDataset(torch.from_numpy(X_val_n),   torch.from_numpy(y_val)),   batch_size=BATCH_SIZE, shuffle=False)
 
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print(f"STEP 4: Training (epochs={EPOCHS}, batch={BATCH_SIZE})")
-print("=" * 60)
-model = LSTMModel(input_size=INPUT_SIZE).to(DEVICE)
-opt   = torch.optim.Adam(model.parameters(), lr=LR)
-crit  = nn.BCEWithLogitsLoss()
+print(f"STEP 3: Training (Stocks + ETFs | Target: 1% Gain)")
+model = ResidualGRU().to(DEVICE)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.05)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LR, steps_per_epoch=len(train_ld), epochs=EPOCHS)
+pos_weight = torch.tensor([(1 - y.mean()) / y.mean()], dtype=torch.float32).to(DEVICE)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-t_train = time.time()
-best_val_loss = float("inf")
-best_state    = None
+best_val_auc = 0
+best_state = None
 
 for epoch in range(EPOCHS):
     model.train()
-    t_loss = 0.0
+    t_loss = 0
     for Xb, yb in train_ld:
         Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
-        opt.zero_grad()
-        loss = crit(model(Xb), yb)
+        optimizer.zero_grad()
+        yb_smooth = yb * 0.9 + 0.05
+        loss = criterion(model(Xb), yb_smooth)
         loss.backward()
-        opt.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
         t_loss += loss.item()
-    t_loss /= len(train_ld)
-
+    
     model.eval()
-    v_loss = 0.0
-    v_preds, v_labs = [], []
+    v_loss, v_preds, v_labs = 0, [], []
     with torch.no_grad():
         for Xb, yb in val_ld:
             Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
             out = model(Xb)
-            v_loss += crit(out, yb).item()
+            v_loss += criterion(out, yb).item()
             v_preds.extend(torch.sigmoid(out).cpu().numpy())
             v_labs.extend(yb.cpu().numpy())
-    v_loss /= len(val_ld)
+    
+    v_preds_arr = np.array(v_preds)
+    auc = roc_auc_score(v_labs, v_preds_arr)
+    print(f"  Epoch {epoch+1:3d} | loss: {t_loss/len(train_ld):.4f} | v_loss: {v_loss/len(val_ld):.4f} | auc: {auc:.4f}")
 
-    acc = accuracy_score(v_labs, (np.array(v_preds) >= 0.5).astype(int))
-    auc = roc_auc_score(v_labs, v_preds)
-    print(f"  Epoch {epoch+1:2d}/{EPOCHS} | train_loss: {t_loss:.4f} | val_loss: {v_loss:.4f} | acc: {acc:.4f} | auc: {auc:.4f}")
+    if auc > best_val_auc:
+        best_val_auc = auc
+        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        torch.save({"model_state": best_state, "mean": mean, "std": std}, os.path.join(MODEL_DIR, "lstm_model_best.pt"))
 
-    if v_loss < best_val_loss:
-        best_val_loss = v_loss
-        best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-elapsed_train = time.time() - t_train
-print(f"\n  Training done in {elapsed_train:.0f}s ({elapsed_train/60:.1f} min)")
-
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("STEP 5: Best model metrics")
-print("=" * 60)
-model.load_state_dict(best_state)
-model.eval()
-
-final_preds, final_labels = [], []
-with torch.no_grad():
-    for Xb, yb in val_ld:
-        out = torch.sigmoid(model(Xb.to(DEVICE))).cpu().numpy()
-        final_preds.extend(out)
-        final_labels.extend(yb.cpu().numpy())
-
-final_preds  = np.array(final_preds)
-final_labels = np.array(final_labels)
-final_acc    = accuracy_score(final_labels, (final_preds >= 0.5).astype(int))
-final_auc    = roc_auc_score(final_labels, final_preds)
-print(f"  Best val_loss:  {best_val_loss:.4f}")
-print(f"  Final accuracy: {final_acc:.4f}")
-print(f"  Final AUC:      {final_auc:.4f}")
-
-# Save model
-model_path = os.path.join(MODEL_DIR, "lstm_model.pt")
-torch.save({
-    "model_state":  best_state,
-    "mean":         mean,
-    "std":          std,
-    "config": {
-        "input_size":   INPUT_SIZE,
-        "hidden_size":  128,
-        "num_layers":   2,
-        "dropout":      0.3,
-        "seq_len":      SEQ_LEN,
-    },
-    "metrics": {
-        "val_loss":     float(best_val_loss),
-        "accuracy":     float(final_acc),
-        "auc":          float(final_auc),
-        "epochs_run":   EPOCHS,
-    },
-}, model_path)
-print(f"  Model saved → {model_path}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("STEP 6: Screening — Top 10 by LSTM up-probability")
-print("=" * 60)
-t_scr = time.time()
-
-stock_last = {}
-for code in stock_codes:
-    df_s = df_candles[df_candles["code"] == code].copy()
-    df_s["date"] = pd.to_datetime(df_s["date"])
-    df_s = df_s.sort_values("date").reset_index(drop=True)
-    if len(df_s) < SEQ_LEN + 10:
-        continue
-    df_s = add_indicators(df_s)
-    for col in ALL_COLS:
-        if col not in df_s.columns:
-            df_s[col] = 0.0
-    data = df_s[ALL_COLS].values.astype(np.float32)
-    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-    stock_last[code] = data[-SEQ_LEN:]
-
-print(f"  Screening {len(stock_last)} stocks ...")
-model.eval()
-results = []
-with torch.no_grad():
-    for code, seq in stock_last.items():
-        seq_n = (seq - mean) / std
-        prob  = torch.sigmoid(model(torch.from_numpy(seq_n[np.newaxis,:]).to(DEVICE)).squeeze(-1)).item()
-        results.append((code, prob))
-
-results.sort(key=lambda x: x[1], reverse=True)
-top10 = results[:10]
-
-conn = sqlite3.connect(DATA_DB)
-df_names = pd.read_sql("SELECT code, name FROM stocks", conn)
-conn.close()
-name_map = dict(zip(df_names["code"], df_names["name"]))
-
-print(f"\n  {'Rank':<5} {'Code':<10} {'Name':<22} {'Prob':>6}")
-print(f"  {'-'*47}")
-for rank, (code, prob) in enumerate(top10, 1):
-    name = name_map.get(code, "Unknown")
-    print(f"  {rank:<5} {code:<10} {name:<22} {prob:.4f}")
-
-print(f"\n  Screening done in {time.time()-t_scr:.1f}s")
-total = time.time() - t_start
-print(f"\n✅ TOTAL TIME: {total:.0f}s ({total/60:.1f} min)")
-print(f"   Model saved: {model_path}")
+print(f"\nTraining Complete. Best val_auc: {best_val_auc:.4f}")
