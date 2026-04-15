@@ -128,7 +128,7 @@ if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
     TRAIN_MIN=""
     if [ -n "$TRAIN_TIME" ]; then
         SECS=$(echo "$TRAIN_TIME" | sed 's/초//')
-        TRAIN_MIN=$((SECS / 60))
+        TRAIN_MIN=$(echo "$SECS / 60" | awk "{printf "%.0f", $1}")
     fi
     MSG="🧠 *LSTM 추가 학습 완료!*\n\n⏱ 소요시간: ${TRAIN_MIN:-?}분\n📈 스크리닝: $RESULTS_FILE"
     curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
