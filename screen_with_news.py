@@ -102,7 +102,7 @@ ALL_COLS     = ["ret", "vol_ret", "rsi", "macd_rel",
 
 TOP_N          = 30     # LSTM 스크리닝 후보 수
 NEWS_TOP_N     = 30     # 뉴스 분석 대상 수 (0이면 전체)
-TEST_MODE      = True   # True: TOP 5만 뉴스 분석 (빠른 테스트)
+TEST_MODE      = False  # 실전용   # True: TOP 5만 뉴스 분석 (빠른 테스트)
 LSTM_WEIGHT    = 0.7
 NEWS_WEIGHT    = 0.3
 
@@ -235,9 +235,16 @@ LSTM_TOP = 10
 TA_TOP = 10
 now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S+09:00")
 
-# LSTM top 10: pure LSTM probability 기준
-scored_by_lstm = sorted(scored, key=lambda x: x["lstm_prob"], reverse=True)
+# LSTM top N: pure LSTM probability 기준 (뉴스 분석 실패해도 LSTM 스톡은 무조건 저장)
+scored_by_lstm = sorted(scored, key=lambda x: x.get("lstm_prob", 0), reverse=True)
 lstm_top10 = scored_by_lstm[:LSTM_TOP]
+
+# 실패한 뉴스 분석 건도 LSTM만으로 채우기
+if len(lstm_top10) < LSTM_TOP:
+    # scored에 안 든 애들은 lstm_prob만 있고 news_score 없는情况
+    all_lstm = [s for s in scored if s.get("lstm_prob", 0) > 0]
+    remaining = [s for s in all_lstm if s not in lstm_top10]
+    lstm_top10.extend(remaining[:LSTM_TOP - len(lstm_top10)])
 lstm_watchlist = {
     "updated": now_str,
     "stocks": [
