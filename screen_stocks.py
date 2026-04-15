@@ -106,5 +106,5 @@ for code in stock_codes:
 results.sort(key=lambda x: x[1], reverse=True)
 print(f"\n  {'Rank':<5} {'Code':<10} {'Name':<20} {'Up Prob':>8}")
 print(f"  {'-'*47}")
-for rank, (code, prob) in enumerate(results[:10], 1):
+for rank, (code, prob) in enumerate(results[:20], 1):
     print(f"  {rank:<5} {code:<10} {name_map.get(code,'Unknown'):<20} {prob:.4f}")
